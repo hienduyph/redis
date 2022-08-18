@@ -3,6 +3,7 @@
 import asyncio
 from asyncio.transports import Transport
 import collections
+import itertools
 import sys
 import time
 from typing import Any, Optional
@@ -18,12 +19,17 @@ data: dict[bytes, Any] = {}
 class Core:
     def __init__(self) -> None:
         self.commands = {
+            b"COMMAND": self.com_command,
             b"GET": self.com_get,
             b"SET": self.com_set,
-            b"COMMAND": self.com_command,
+            b"PING": self.com_ping,
+            b"INCR": self.com_incr,
+            b"LPUSH": self.com_lpush,
+            b"RPUSH": self.com_rpush,
+            b"LRANGE": self.com_lrange,
         }
 
-    def com_command(self, *args):
+    def com_command(self):
         # just enough to pleasure the redis-cli
         return b"+OK\r\n"
 
@@ -78,6 +84,66 @@ class Core:
             return b"-WRONGTYPE Operation against a key holding the wrong kind of value"
         return b"$%d\r\n%s\r\n" % (len(value), value)
 
+    def com_ping(self, msg=b"PONG"):
+        return b"$%d\r\n%s" % (len(msg), msg)
+
+    def com_incr(self, key):
+        value = self._get(key) or 0
+        if type(value) is bytes:
+            try:
+                value = int(value)
+            except ValueError:
+                return "b-value is not an integer or out of range"
+        value += 1
+        self._set(key, str(value).encode())
+        return b":%d\r\n" % value
+
+    def com_lpush(self, key: bytes, *values: list[bytes]):
+        deque = self._get(key, collections.deque())
+        if not isinstance(deque, collections.deque):
+            return b"-WRONGTYPE Operation against a key holding the wrong kind of value"
+
+        deque.extendleft(values)
+        self._set(key, deque)
+        return b":%d\r\n" % (len(deque),)
+
+    def com_rpush(self, key: bytes, *values: list[bytes]):
+        deque = self._get(key, collections.deque())
+        if not isinstance(deque, collections.deque):
+            return b"-WRONGTYPE Operation against a key holding the wrong kind of value"
+        deque.extend(values)
+        self._set(key, deque)
+        return b":%d\r\n" % (len(deque), )
+
+    def com_lrange(self, key: bytes, *args: list[bytes]):
+        deque: Optional[collections.deque] = self._get(key, None)
+        if deque is None:
+            return b"*0\r\n"
+        if not isinstance(deque, collections.deque):
+            return b"-WRONGTYPE operations against a key holding the wrong kind of value"
+        start = 0
+        end = len(deque)
+        if len(args) > 0:
+            start = int(args[0])
+        if len(args) >= 1:
+            end = int(args[1])
+
+        if start < 0:
+            start = start + len(deque)
+        if end < 0:
+            end = end + len(deque)
+
+        if end > len(deque):
+            end = len(deque)
+
+        if start >= len(deque): # out of range
+            return b"*0\r\n"
+
+        items = [b"$%d\r\n%s\r\n" % (len(v), v) for v in itertools.islice(deque,start, end)]
+        prefix = b"*%d\r\n" % len(deque)
+        return prefix + b''.join(items[::-1])
+
+
     def _get(self, key, default=None):
         self._evit_if_expired(key)
         return data.get(key, default)
@@ -95,7 +161,7 @@ class Core:
             del data[key]
 
 
-class RedisProtocol(asyncio.Protocol, Core):
+class RedisProtocol(asyncio.Protocol):
     """
     State machine of calls:
 
@@ -110,7 +176,7 @@ class RedisProtocol(asyncio.Protocol, Core):
     def __init__(self) -> None:
         self.parser = hiredis.Reader()
         self.transport: Optional[Transport] = None
-        super(Core, self).__init__()
+        self._funs = Core()
 
     def connection_made(self, transport: Transport):
         self.transport = transport
@@ -122,7 +188,7 @@ class RedisProtocol(asyncio.Protocol, Core):
             req = self.parser.gets()
             if req is False:
                 break
-            cmd = self.commands[req[0].upper()]
+            cmd = self._funs.commands[req[0].upper()]
             resp.append(cmd(*req[1:]))
 
         if self.transport:
