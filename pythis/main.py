@@ -27,6 +27,8 @@ class Core:
             b"LPUSH": self.com_lpush,
             b"RPUSH": self.com_rpush,
             b"LRANGE": self.com_lrange,
+            b"LPOP": self.com_lpop,
+            b"RPOP": self.com_rpop,
         }
 
     def com_command(self):
@@ -103,7 +105,7 @@ class Core:
         if not isinstance(deque, collections.deque):
             return b"-WRONGTYPE Operation against a key holding the wrong kind of value"
 
-        deque.extendleft(values)
+        deque.extendleft(values[::-1])
         self._set(key, deque)
         return b":%d\r\n" % (len(deque),)
 
@@ -113,14 +115,16 @@ class Core:
             return b"-WRONGTYPE Operation against a key holding the wrong kind of value"
         deque.extend(values)
         self._set(key, deque)
-        return b":%d\r\n" % (len(deque), )
+        return b":%d\r\n" % (len(deque),)
 
-    def com_lrange(self, key: bytes, *args: list[bytes]):
+    def com_lrange(self, key: bytes, *args: bytes):
         deque: Optional[collections.deque] = self._get(key, None)
         if deque is None:
             return b"*0\r\n"
         if not isinstance(deque, collections.deque):
-            return b"-WRONGTYPE operations against a key holding the wrong kind of value"
+            return (
+                b"-WRONGTYPE operations against a key holding the wrong kind of value"
+            )
         start = 0
         end = len(deque)
         if len(args) > 0:
@@ -136,13 +140,56 @@ class Core:
         if end > len(deque):
             end = len(deque)
 
-        if start >= len(deque): # out of range
+        if start >= len(deque):  # out of range
             return b"*0\r\n"
 
-        items = [b"$%d\r\n%s\r\n" % (len(v), v) for v in itertools.islice(deque,start, end)]
+        items = [
+            b"$%d\r\n%s\r\n" % (len(v), v) for v in itertools.islice(deque, start, end)
+        ]
         prefix = b"*%d\r\n" % len(deque)
-        return prefix + b''.join(items[::-1])
+        return prefix + b"".join(items)
 
+    def com_lpop(self, key: bytes, count: Optional[bytes]=None):
+        deque = self._get(key, None)
+        if deque is None:
+            return b"*0\r\n"
+        if not isinstance(deque, collections.deque):
+            return b"-WRONGTYPE invalid type"
+
+        size = 1
+        if count is not None:
+            size = int(count)
+        if size >= len(deque):
+            size = len(deque)
+
+        items = []
+        for _ in range(0, size):
+            item = deque.popleft()
+            items.append(b"$%d\r\n%s\r\n" % (len(item), item))
+
+
+        self._set(key, deque)
+        size = b"*%d\r\n" % len(items)
+        return size + b"".join(items)
+
+    def com_rpop(self, key: bytes, count: Optional[int]=None):
+        deque = self._get(key, None)
+        if not deque:
+            return b"*0\r\n"
+        if not isinstance(deque, collections.deque):
+            return b"-WRONGTYPE invalid type"
+        size = 1
+        if count is not None:
+            size = int(count)
+        if size > len(deque):
+            size = len(deque)
+        items = []
+        for _ in range(size):
+            item = deque.pop()
+            items.append(b"$%d\r\n%s\r\n" % (len(item), item))
+        self._set(key, deque)
+        size = b"*%d\r\n" % len(items)
+        return size + b"".join(items)
 
     def _get(self, key, default=None):
         self._evit_if_expired(key)
