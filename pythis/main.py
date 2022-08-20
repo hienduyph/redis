@@ -6,13 +6,8 @@ import collections
 import itertools
 import socket
 import sys
-import time
 import selectors
-from typing import Any, Optional
-
-import hiredis
-import uvloop
-from loguru import logger
+from typing import Any, List, Optional, Union
 
 expirations: dict[bytes, Any] = collections.defaultdict(lambda: float("inf"))
 data: dict[bytes, Any] = {}
@@ -20,10 +15,56 @@ data: dict[bytes, Any] = {}
 PORT = 6380
 HOST = "127.0.0.1"
 
+TERMINATE = b"\r\n"
+TYPE_ARRAY = ord(b"*")
+TYPE_BULK_STRING = ord(b"$")
+
+def find_closed(buf: bytes, cursor: int, next_char=TERMINATE) -> int:
+    c = cursor
+    char_len = len(next_char)
+    for i in range(len(buf) - cursor - char_len):
+        _slice = buf[c+i:c+i+char_len]
+        if next_char == _slice:
+            return c+i # index of the start char
+    return -1
+
+class Reader:
+    def __init__(self) -> None:
+        self.cmds = collections.deque()
+
+    def feed(self, buf: bytes):
+        # assume we received full frames
+        cursor = 0
+        cmds = []
+        while cursor < len(buf):
+            type_ =  buf[cursor]
+            cursor += 1
+            if type_ == TYPE_ARRAY:
+                array_size = int(chr(buf[cursor]))
+                cursor += 3
+                for _ in range(array_size):
+                    _type = buf[cursor]
+                    cursor += 1
+                    if _type == TYPE_BULK_STRING:
+                        # find next \r\n
+                        end = find_closed(buf, cursor, TERMINATE)
+                        if end == -1:
+                            raise Exception(f"Invalid length at pos {cursor}")
+                        string_length = int(buf[cursor:end])
+                        cursor += (2 + end - cursor)
+                        cmds.extend(buf[cursor:cursor+string_length].split(b" "))
+                        cursor += (string_length + 2) # plus term
+        self.cmds.append(cmds)
+
+    def gets(self) -> Union[bool, List[bytes]]:
+        if len(self.cmds) == 0:
+            return False
+        return self.cmds.popleft()
+
 
 class Core:
     def __init__(self) -> None:
-        self.parser = hiredis.Reader()
+        self.parser = Reader()
         self.commands = {
             b"COMMAND": self.com_command,
             b"GET": self.com_get,
@@ -35,19 +76,18 @@ class Core:
             b"LRANGE": self.com_lrange,
             b"LPOP": self.com_lpop,
             b"RPOP": self.com_rpop,
+            b"CONFIG": self.com_config,
         }
 
     def process(self, buf: bytes) -> list[bytes]:
-        logger.debug("process bufs {}", len(buf))
         self.parser.feed(buf)
         resp = []
         while True:
             req = self.parser.gets()
             if req is False:
-                logger.info("End of command")
                 break
             cmd = req[0].upper()
-            logger.info("Processing Command {}", cmd)
+            # print(f"Handle comand {cmd}")
             res = self.commands[cmd](*req[1:])
             resp.append(res)
         return resp
@@ -109,6 +149,9 @@ class Core:
 
     def com_ping(self, msg=b"PONG"):
         return b"$%d\r\n%s" % (len(msg), msg)
+
+    def com_config(self, *_: bytes):
+        return b"*0\r\n"
 
     def com_incr(self, key):
         value = self._get(key) or 0
@@ -241,7 +284,7 @@ class AsyncRedisProtocolImpl(asyncio.Protocol):
     """
 
     def __init__(self) -> None:
-        self.parser = hiredis.Reader()
+        self.parser = Reader()
         self.transport: Optional[Transport] = None
         self._funs = Core()
 
@@ -254,7 +297,7 @@ class AsyncRedisProtocolImpl(asyncio.Protocol):
             self.transport.writelines(resp)
 
 
-class SyncSocket:
+class NonBlockingSocket:
     def __init__(self):
         self._funcs = Core()
         self.run = True
@@ -262,11 +305,12 @@ class SyncSocket:
     def __call__(self, *args: Any, **kwds: Any) -> Any:
         # implement a non blocking server using selectors
         # https://docs.python.org/3/library/selectors.html#examples
+        print("Handle using no blocking socket")
         import signal
 
         def _stop(*args: Any):
             self.run = False
-            logger.info("Received graceful shutdown. IsRun {}", self.run)
+            print("Received graceful shutdown")
 
         signal.signal(signal.SIGINT, _stop)
         signal.signal(signal.SIGTERM, _stop)
@@ -274,25 +318,25 @@ class SyncSocket:
         sel = selectors.DefaultSelector()
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((HOST, PORT))
         sock.listen()
         sock.setblocking(False)
-        logger.info("Wating for conn at {}", PORT)
+        print(f"Wating for conn at {PORT}")
         sel.register(sock, selectors.EVENT_READ, self.accept(sel, self.run))
         while self.run:
-            logger.debug("Poll Selects")
             events = sel.select(timeout=5)
             for key, mask in events:
                 if key.data is None:
                     continue
                 key.data(key.fileobj, mask)
 
-        logger.info("Shutdown, good bye ...")
+        print("Shutdown, good bye ...")
 
     def accept(self, sel: selectors.BaseSelector, run: bool):
         def _h(key: socket.socket, mask: int):
             conn, addr = key.accept()
-            logger.info("connected {}", addr)
+            # print(f"connected {addr}")
             conn.setblocking(False)
             sel.register(conn, selectors.EVENT_READ, self.handle(addr, sel, run))
 
@@ -306,28 +350,31 @@ class SyncSocket:
             try:
                 buf = conn.recv(1024)
                 if not buf:
-                    logger.info("{} disconnected by", addr)
+                    # print(f"{addr} disconnected")
                     sel.unregister(conn)
                     conn.close()
                     return
-                logger.info("{} data received", addr)
                 res = self._funcs.process(buf)
                 for r in res:
                     conn.sendall(r)
             except Exception as e:
-                logger.info("{} handle error: {e}", addr, e)
+                print(f"{addr} handle error: {e}")
                 sel.unregister(conn)
                 conn.close()
 
         return _h
 
 
-def asyncmain() -> int:
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+def asyncmain(uv = False) -> int:
+    if uv:
+        import uvloop
+        print("Using uvloop")
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
     loop = asyncio.new_event_loop()
     coro = loop.create_server(AsyncRedisProtocolImpl, HOST, PORT)
     server = loop.run_until_complete(coro)
-    logger.info("Listening on {}", PORT)
+    print(f"Listening on {PORT}")
     try:
         loop.run_forever()
     except KeyboardInterrupt:
@@ -346,11 +393,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--handle", type=str, default="async", help="Run in async or sync mode"
+        "--handle", type=str, default="non_blocking_socket", help="Choose mode type to run non_blocking_socket/asyncio/uvloop"
     )
     args = parser.parse_args()
     handles = {
-        "sync": SyncSocket(),
-        "async": asyncmain,
+        "non_blocking_socket": NonBlockingSocket(),
+        "asyncio": asyncmain,
+        "uvloop": lambda: asyncmain(uv=True),
     }
     sys.exit(handles[args.handle]())

@@ -1,3 +1,0 @@
-hiredis==2.0.0
-uvloop==0.16.0
-loguru==0.6.0
