@@ -4,8 +4,10 @@ import asyncio
 from asyncio.transports import Transport
 import collections
 import itertools
+import socket
 import sys
 import time
+import selectors
 from typing import Any, Optional
 
 import hiredis
@@ -15,9 +17,13 @@ from loguru import logger
 expirations: dict[bytes, Any] = collections.defaultdict(lambda: float("inf"))
 data: dict[bytes, Any] = {}
 
+PORT = 6380
+HOST = "127.0.0.1"
+
 
 class Core:
     def __init__(self) -> None:
+        self.parser = hiredis.Reader()
         self.commands = {
             b"COMMAND": self.com_command,
             b"GET": self.com_get,
@@ -30,6 +36,21 @@ class Core:
             b"LPOP": self.com_lpop,
             b"RPOP": self.com_rpop,
         }
+
+    def process(self, buf: bytes) -> list[bytes]:
+        logger.debug("process bufs {}", len(buf))
+        self.parser.feed(buf)
+        resp = []
+        while True:
+            req = self.parser.gets()
+            if req is False:
+                logger.info("End of command")
+                break
+            cmd = req[0].upper()
+            logger.info("Processing Command {}", cmd)
+            res = self.commands[cmd](*req[1:])
+            resp.append(res)
+        return resp
 
     def com_command(self):
         # just enough to pleasure the redis-cli
@@ -149,7 +170,7 @@ class Core:
         prefix = b"*%d\r\n" % len(deque)
         return prefix + b"".join(items)
 
-    def com_lpop(self, key: bytes, count: Optional[bytes]=None):
+    def com_lpop(self, key: bytes, count: Optional[bytes] = None):
         deque = self._get(key, None)
         if deque is None:
             return b"*0\r\n"
@@ -167,12 +188,11 @@ class Core:
             item = deque.popleft()
             items.append(b"$%d\r\n%s\r\n" % (len(item), item))
 
-
         self._set(key, deque)
         size = b"*%d\r\n" % len(items)
         return size + b"".join(items)
 
-    def com_rpop(self, key: bytes, count: Optional[int]=None):
+    def com_rpop(self, key: bytes, count: Optional[int] = None):
         deque = self._get(key, None)
         if not deque:
             return b"*0\r\n"
@@ -208,7 +228,7 @@ class Core:
             del data[key]
 
 
-class RedisProtocol(asyncio.Protocol):
+class AsyncRedisProtocolImpl(asyncio.Protocol):
     """
     State machine of calls:
 
@@ -229,26 +249,85 @@ class RedisProtocol(asyncio.Protocol):
         self.transport = transport
 
     def data_received(self, data: bytes) -> None:
-        resp = []
-        self.parser.feed(data)
-        while True:
-            req = self.parser.gets()
-            if req is False:
-                break
-            cmd = self._funs.commands[req[0].upper()]
-            resp.append(cmd(*req[1:]))
-
+        resp = self._funs.process(data)
         if self.transport:
             self.transport.writelines(resp)
 
 
-def main() -> int:
+class SyncSocket:
+    def __init__(self):
+        self._funcs = Core()
+        self.run = True
+
+    def __call__(self, *args: Any, **kwds: Any) -> Any:
+        # implement a non blocking server using selectors
+        # https://docs.python.org/3/library/selectors.html#examples
+        import signal
+
+        def _stop(*args: Any):
+            self.run = False
+            logger.info("Received graceful shutdown. IsRun {}", self.run)
+
+        signal.signal(signal.SIGINT, _stop)
+        signal.signal(signal.SIGTERM, _stop)
+
+        sel = selectors.DefaultSelector()
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind((HOST, PORT))
+        sock.listen()
+        sock.setblocking(False)
+        logger.info("Wating for conn at {}", PORT)
+        sel.register(sock, selectors.EVENT_READ, self.accept(sel, self.run))
+        while self.run:
+            logger.debug("Poll Selects")
+            events = sel.select(timeout=5)
+            for key, mask in events:
+                if key.data is None:
+                    continue
+                key.data(key.fileobj, mask)
+
+        logger.info("Shutdown, good bye ...")
+
+    def accept(self, sel: selectors.BaseSelector, run: bool):
+        def _h(key: socket.socket, mask: int):
+            conn, addr = key.accept()
+            logger.info("connected {}", addr)
+            conn.setblocking(False)
+            sel.register(conn, selectors.EVENT_READ, self.handle(addr, sel, run))
+
+        return _h
+
+    def handle(self, addr: str, sel: selectors.BaseSelector, run: bool):
+        def _h(
+            conn: socket.socket,
+            mask: int,
+        ):
+            try:
+                buf = conn.recv(1024)
+                if not buf:
+                    logger.info("{} disconnected by", addr)
+                    sel.unregister(conn)
+                    conn.close()
+                    return
+                logger.info("{} data received", addr)
+                res = self._funcs.process(buf)
+                for r in res:
+                    conn.sendall(r)
+            except Exception as e:
+                logger.info("{} handle error: {e}", addr, e)
+                sel.unregister(conn)
+                conn.close()
+
+        return _h
+
+
+def asyncmain() -> int:
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     loop = asyncio.new_event_loop()
-    port = 6380
-    coro = loop.create_server(RedisProtocol, "127.0.0.1", port)
+    coro = loop.create_server(AsyncRedisProtocolImpl, HOST, PORT)
     server = loop.run_until_complete(coro)
-    logger.info("Listening on {}", port)
+    logger.info("Listening on {}", PORT)
     try:
         loop.run_forever()
     except KeyboardInterrupt:
@@ -263,5 +342,15 @@ def main() -> int:
 
 if __name__ == "__main__":
     import sys
+    import argparse
 
-    sys.exit(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--handle", type=str, default="async", help="Run in async or sync mode"
+    )
+    args = parser.parse_args()
+    handles = {
+        "sync": SyncSocket(),
+        "async": asyncmain,
+    }
+    sys.exit(handles[args.handle]())
