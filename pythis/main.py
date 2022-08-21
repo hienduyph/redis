@@ -19,14 +19,16 @@ TERMINATE = b"\r\n"
 TYPE_ARRAY = ord(b"*")
 TYPE_BULK_STRING = ord(b"$")
 
+
 def find_closed(buf: bytes, cursor: int, next_char=TERMINATE) -> int:
     c = cursor
     char_len = len(next_char)
     for i in range(len(buf) - cursor - char_len):
-        _slice = buf[c+i:c+i+char_len]
+        _slice = buf[c + i : c + i + char_len]
         if next_char == _slice:
-            return c+i # index of the start char
+            return c + i  # index of the start char
     return -1
+
 
 class Reader:
     def __init__(self) -> None:
@@ -34,14 +36,15 @@ class Reader:
 
     def feed(self, buf: bytes):
         # assume we received full frames
+        # print(f"Got buf {buf}")
         cursor = 0
-        cmds = []
         while cursor < len(buf):
-            type_ =  buf[cursor]
+            type_ = buf[cursor]
             cursor += 1
             if type_ == TYPE_ARRAY:
                 array_size = int(chr(buf[cursor]))
                 cursor += 3
+                cmds = []
                 for _ in range(array_size):
                     _type = buf[cursor]
                     cursor += 1
@@ -51,10 +54,10 @@ class Reader:
                         if end == -1:
                             raise Exception(f"Invalid length at pos {cursor}")
                         string_length = int(buf[cursor:end])
-                        cursor += (2 + end - cursor)
-                        cmds.extend(buf[cursor:cursor+string_length].split(b" "))
-                        cursor += (string_length + 2) # plus term
-        self.cmds.append(cmds)
+                        cursor += 2 + end - cursor
+                        cmds.extend(buf[cursor : cursor + string_length].split(b" "))
+                        cursor += string_length + 2  # plus term
+                self.cmds.append(cmds)
 
     def gets(self) -> Union[bool, List[bytes]]:
         if len(self.cmds) == 0:
@@ -299,7 +302,6 @@ class AsyncRedisProtocolImpl(asyncio.Protocol):
 
 class NonBlockingSocket:
     def __init__(self):
-        self._funcs = Core()
         self.run = True
 
     def __call__(self, *args: Any, **kwds: Any) -> Any:
@@ -335,14 +337,17 @@ class NonBlockingSocket:
 
     def accept(self, sel: selectors.BaseSelector, run: bool):
         def _h(key: socket.socket, mask: int):
+            # create each cores process per conn
             conn, addr = key.accept()
             # print(f"connected {addr}")
             conn.setblocking(False)
-            sel.register(conn, selectors.EVENT_READ, self.handle(addr, sel, run))
+            sel.register(
+                conn, selectors.EVENT_READ, self.handle(addr, sel, run, Core())
+            )
 
         return _h
 
-    def handle(self, addr: str, sel: selectors.BaseSelector, run: bool):
+    def handle(self, addr: str, sel: selectors.BaseSelector, run: bool, fn: Core):
         def _h(
             conn: socket.socket,
             mask: int,
@@ -354,7 +359,7 @@ class NonBlockingSocket:
                     sel.unregister(conn)
                     conn.close()
                     return
-                res = self._funcs.process(buf)
+                res = fn.process(buf)
                 for r in res:
                     conn.sendall(r)
             except Exception as e:
@@ -365,9 +370,10 @@ class NonBlockingSocket:
         return _h
 
 
-def asyncmain(uv = False) -> int:
+def asyncmain(uv=False) -> int:
     if uv:
         import uvloop
+
         print("Using uvloop")
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -393,7 +399,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--handle", type=str, default="non_blocking_socket", help="Choose mode type to run non_blocking_socket/asyncio/uvloop"
+        "--handle",
+        type=str,
+        default="non_blocking_socket",
+        help="Choose mode type to run non_blocking_socket/asyncio/uvloop",
     )
     args = parser.parse_args()
     handles = {
