@@ -6,7 +6,6 @@ import collections
 import itertools
 import socket
 import sys
-import selectors
 from typing import Any, List, Optional, Union
 
 expirations: dict[bytes, Any] = collections.defaultdict(lambda: float("inf"))
@@ -31,6 +30,7 @@ def find_closed(buf: bytes, cursor: int, next_char=TERMINATE) -> int:
 
 
 class Reader:
+    """A very simple redis parser to process the command at server side"""
     def __init__(self) -> None:
         self.cmds = collections.deque()
 
@@ -274,7 +274,7 @@ class Core:
             del data[key]
 
 
-class AsyncRedisProtocolImpl(asyncio.Protocol):
+class Protocol(asyncio.Protocol):
     """
     State machine of calls:
 
@@ -300,85 +300,72 @@ class AsyncRedisProtocolImpl(asyncio.Protocol):
             self.transport.writelines(resp)
 
 
-class NonBlockingSocket:
+class PlainSocket:
     def __init__(self):
         self.run = True
 
-    def __call__(self, *args: Any, **kwds: Any) -> Any:
-        # implement a non blocking server using selectors
-        # https://docs.python.org/3/library/selectors.html#examples
-        print("Handle using no blocking socket")
-        import signal
+    def __call__(self):
+        asyncio.run(self.serve())
 
-        def _stop(*args: Any):
-            self.run = False
-            print("Received graceful shutdown")
-
-        signal.signal(signal.SIGINT, _stop)
-        signal.signal(signal.SIGTERM, _stop)
-
-        sel = selectors.DefaultSelector()
-
+    async def serve(self) -> Any:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((HOST, PORT))
-        sock.listen()
+        sock.listen(8)
         sock.setblocking(False)
         print(f"Wating for conn at {PORT}")
-        sel.register(sock, selectors.EVENT_READ, self.accept(sel, self.run))
-        while self.run:
-            events = sel.select(timeout=5)
-            for key, mask in events:
-                if key.data is None:
-                    continue
-                key.data(key.fileobj, mask)
+        loop = asyncio.get_event_loop()
+        while True:
+            client, _ = await loop.sock_accept(sock)
+            loop.create_task(self.handle_client(client))
 
-        print("Shutdown, good bye ...")
-
-    def accept(self, sel: selectors.BaseSelector, run: bool):
-        def _h(key: socket.socket, mask: int):
-            # create each cores process per conn
-            conn, addr = key.accept()
-            # print(f"connected {addr}")
-            conn.setblocking(False)
-            sel.register(
-                conn, selectors.EVENT_READ, self.handle(addr, sel, run, Core())
-            )
-
-        return _h
-
-    def handle(self, addr: str, sel: selectors.BaseSelector, run: bool, fn: Core):
-        def _h(
-            conn: socket.socket,
-            mask: int,
-        ):
-            try:
-                buf = conn.recv(1024)
-                if not buf:
-                    # print(f"{addr} disconnected")
-                    sel.unregister(conn)
-                    conn.close()
-                    return
-                res = fn.process(buf)
-                for r in res:
-                    conn.sendall(r)
-            except Exception as e:
-                print(f"{addr} handle error: {e}")
-                sel.unregister(conn)
-                conn.close()
-
-        return _h
+    async def handle_client(self, client):
+        fn = Core()
+        loop = asyncio.get_event_loop()
+        while True:
+            # this seem blocks requests
+            buf = await loop.sock_recv(client, 255)
+            if not buf:
+                break
+            res = fn.process(buf)
+            for r in res:
+                await loop.sock_sendall(client, r)
+        client.close()
 
 
-def asyncmain(uv=False) -> int:
-    if uv:
-        import uvloop
+class Server:
+    def __init__(self):
+        pass
 
-        print("Using uvloop")
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    def __call__(self):
+        try:
+            asyncio.run(self.serve())
+        except KeyboardInterrupt:
+            pass
+        return 0
 
+    async def serve(self):
+        s = await asyncio.start_server(self.handle, HOST, PORT)
+        async with s:
+            await s.serve_forever()
+
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        buf = None
+        fn = Core()
+        while True:
+            buf = await reader.read(1024)
+            if not buf:
+                break
+            res = fn.process(buf)
+            for r in res:
+                writer.write(r)
+            await writer.drain()
+        writer.close()
+
+
+def asyncio_protocol() -> int:
     loop = asyncio.new_event_loop()
-    coro = loop.create_server(AsyncRedisProtocolImpl, HOST, PORT)
+    coro = loop.create_server(Protocol, HOST, PORT)
     server = loop.run_until_complete(coro)
     print(f"Listening on {PORT}")
     try:
@@ -397,17 +384,24 @@ if __name__ == "__main__":
     import sys
     import argparse
 
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        print("Using uvloop")
+    except ImportError:
+        pass
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--handle",
         type=str,
-        default="non_blocking_socket",
-        help="Choose mode type to run non_blocking_socket/asyncio/uvloop",
+        default="protocol",
+        help="Choose mode type to run plain_socket/protocol/server",
     )
     args = parser.parse_args()
     handles = {
-        "non_blocking_socket": NonBlockingSocket(),
-        "asyncio": asyncmain,
-        "uvloop": lambda: asyncmain(uv=True),
+        "plain_socket": PlainSocket(),
+        "protocol": asyncio_protocol,
+        "server": Server(),
     }
     sys.exit(handles[args.handle]())
