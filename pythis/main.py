@@ -7,6 +7,7 @@ import itertools
 import socket
 import sys
 from typing import Any, List, Optional, Union
+import time
 
 expirations: dict[bytes, Any] = collections.defaultdict(lambda: float("inf"))
 data: dict[bytes, Any] = {}
@@ -31,12 +32,12 @@ def find_closed(buf: bytes, cursor: int, next_char=TERMINATE) -> int:
 
 class Reader:
     """A very simple redis parser to process the command at server side"""
+
     def __init__(self) -> None:
         self.cmds = collections.deque()
 
     def feed(self, buf: bytes):
         # assume we received full frames
-        # print(f"Got buf {buf}")
         cursor = 0
         while cursor < len(buf):
             type_ = buf[cursor]
@@ -145,7 +146,7 @@ class Core:
     def com_get(self, key: bytes) -> bytes:
         value = self._get(key)
         if not value:
-            return b"-1\r\n"
+            return b"$-1\r\n"
         if not isinstance(value, bytes):
             return b"-WRONGTYPE Operation against a key holding the wrong kind of value"
         return b"$%d\r\n%s\r\n" % (len(value), value)
@@ -308,28 +309,26 @@ class PlainSocket:
         asyncio.run(self.serve())
 
     async def serve(self) -> Any:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((HOST, PORT))
-        sock.listen(8)
         sock.setblocking(False)
+        sock.bind((HOST, PORT))
+        sock.listen(10)
         print(f"Wating for conn at {PORT}")
         loop = asyncio.get_event_loop()
         while True:
-            client, _ = await loop.sock_accept(sock)
-            loop.create_task(self.handle_client(client))
+            client, addr = await loop.sock_accept(sock)
+            loop.create_task(self.handle_client(loop, client))
 
-    async def handle_client(self, client):
+    async def handle_client(self, loop, client):
         fn = Core()
-        loop = asyncio.get_event_loop()
         while True:
             # this seem blocks requests
-            buf = await loop.sock_recv(client, 255)
+            buf = await loop.sock_recv(client, 1024)
             if not buf:
                 break
             res = fn.process(buf)
-            for r in res:
-                await loop.sock_sendall(client, r)
+            await loop.sock_sendall(client, b"".join(res))
         client.close()
 
 
@@ -357,8 +356,7 @@ class Server:
             if not buf:
                 break
             res = fn.process(buf)
-            for r in res:
-                writer.write(r)
+            writer.write(b"".join(res))
             await writer.drain()
         writer.close()
 
@@ -386,6 +384,7 @@ if __name__ == "__main__":
 
     try:
         import uvloop
+
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         print("Using uvloop")
     except ImportError:
