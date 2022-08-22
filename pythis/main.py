@@ -8,9 +8,9 @@ import socket
 import sys
 from typing import Any, List, Optional, Union
 import time
+import os
+import zlib
 
-expirations: dict[bytes, Any] = collections.defaultdict(lambda: float("inf"))
-data: dict[bytes, Any] = {}
 
 PORT = 6380
 HOST = "127.0.0.1"
@@ -18,6 +18,51 @@ HOST = "127.0.0.1"
 TERMINATE = b"\r\n"
 TYPE_ARRAY = ord(b"*")
 TYPE_BULK_STRING = ord(b"$")
+
+
+class Shard:
+    def __init__(self):
+        self.expirations: dict[bytes, Any] = collections.defaultdict(
+            lambda: float("inf")
+        )
+        self.data: dict[bytes, Any] = {}
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def __contains__(self, key):
+        return key in self.data
+
+    def __setitem__(self, key, value):
+        self.data[key] = value
+
+    def _db(self, _: bytes):
+        return self
+
+
+class DB:
+    def __init__(self):
+        self.num_shards = os.cpu_count() or 1
+        print(f"Using {self.num_shards} shards")
+        self.shards = [Shard() for _ in range(self.num_shards)]
+
+    def __contains__(self, key):
+        return key in self._db(key).data
+
+    def get(self, key, default=None):
+        return self._db(key).data.get(key, default)
+
+    def __setitem__(self, key, value):
+        self._db(key).data[key] = value
+
+    def _db(self, key: bytes):
+        return self.shards[zlib.crc32(key) % self.num_shards]
+
+
+if os.getenv("MULTI"):
+    data = DB()
+else:
+    data = Shard()
 
 
 def find_closed(buf: bytes, cursor: int, next_char=TERMINATE) -> int:
@@ -105,7 +150,6 @@ class Core:
         value = args[1]
         expires_at = None
         cond = b""
-        self._evit_if_expired(key)
 
         if len(args) == 3:
             cond = args[2]  # SET key value NX|XX
@@ -259,20 +303,26 @@ class Core:
         return size + b"".join(items)
 
     def _get(self, key, default=None):
-        self._evit_if_expired(key)
-        return data.get(key, default)
+        shard = data._db(key)
+        self._evit_if_expired(shard, key)
+        return shard.get(key, default)
 
-    def _set(self, key, value, expires_at: Optional[float] = None):
+    def _set(
+        self, key, value, expires_at: Optional[float] = None, evit_if_expires=False
+    ):
+        shard = data._db(key)
         data[key] = value
+        if evit_if_expires:
+            self._evit_if_expired(shard, key)
         if expires_at is not None:
-            expirations[key] = expires_at
+            shard.expirations[key] = expires_at
         else:
-            expirations.pop(key, None)
+            shard.expirations.pop(key, None)
 
-    def _evit_if_expired(self, key):
-        if key in expirations and expirations[key] < time.monotonic():
-            del expirations[key]
-            del data[key]
+    def _evit_if_expired(self, shard: Shard, key: bytes):
+        if key in shard.expirations and shard.expirations[key] < time.monotonic():
+            del shard.expirations[key]
+            del shard.data[key]
 
 
 class Protocol(asyncio.Protocol):
