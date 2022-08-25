@@ -15,19 +15,21 @@ name = "rudis-server"
 path = "src/bin/server.rs"
 
 [dependencies]
-async-stream = "0.3.2"
-atoi = "0.4.0"
-bytes = "1.1.0"
-structopt = "0.3.25"
-tokio = { version = "1.15.0", features = ["full"] }
-tokio-stream = "0.1.8"
-tracing = "0.1.29"
+async-stream = "0.3.3"
+atoi = "1.0.0"
+bytes = "1.2.1"
+structopt = "0.3.26"
+tokio = { version = "1.20.1", features = ["full"] }
+futures = { version = "0.3.23", default-features = false }
+futures-util = "0.3"
+tokio-stream = "0.1.9"
+tracing = "0.1.36"
 tracing-futures = "0.2.5"
-tracing-subscriber = "0.3.4"
-log = "0.4.14"
+tracing-subscriber = "0.3.15"
+log = "0.4.17"
 env_logger = "0.9.0"
-rocksdb = "0.17.0"
+rocksdb = "0.19.0"
 
 [dev-dependencies]
 # Enable test-utilities in dev mode only. This is mostly for tests.
-tokio = { version = "1.15.0", features = ["test-util"] }
+tokio = { version = "1.20.1", features = ["test-util"] }

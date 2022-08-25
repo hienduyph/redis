@@ -12,6 +12,7 @@ pub enum Frame {
     Bulk(Bytes),
     Null,
     Array(Vec<Frame>),
+    Pipe(Vec<Frame>),
 }
 
 #[derive(Debug)]
@@ -26,6 +27,10 @@ pub enum Error {
 impl Frame {
     pub(crate) fn array() -> Frame {
         Frame::Array(vec![])
+    }
+
+    pub(crate) fn new_array(arr: Vec<Frame>) -> Frame {
+        Frame::Array(arr)
     }
 
     /// Push a bulk frame into the array, `self` must be an Array frame
@@ -168,7 +173,7 @@ impl std::fmt::Display for Frame {
                 Err(_) => write!(fmt, "{:?}", msg),
             },
             Frame::Null => "(nil)".fmt(fmt),
-            Frame::Array(parts) => {
+            Frame::Array(parts) | Frame::Pipe(parts) => {
                 for (i, part) in parts.iter().enumerate() {
                     if i > 0 {
                         write!(fmt, " ")?;
@@ -176,7 +181,7 @@ impl std::fmt::Display for Frame {
                     }
                 }
                 Ok(())
-            }
+            },
         }
     }
 }
@@ -208,7 +213,7 @@ fn skip(src: &mut Cursor<&[u8]>, n: usize) -> Result<(), Error> {
 fn get_decimal(src: &mut Cursor<&[u8]>) -> Result<u64, Error> {
     use atoi::atoi;
     let line = get_line(src)?;
-    atoi::<u64>(line).ok_or_else(|| "protocol error; invalid frame format".into())
+    atoi::<u64>(line).ok_or_else(|| "protocol error; invalid frame format decimal".into())
 }
 
 // Find a line, return buffer and set the cursor to end after `\n`
