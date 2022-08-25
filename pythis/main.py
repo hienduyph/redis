@@ -6,10 +6,8 @@ import collections
 import itertools
 import socket
 import sys
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional
 import time
-import os
-import zlib
 
 
 PORT = 6380
@@ -20,7 +18,7 @@ TYPE_ARRAY = ord(b"*")
 TYPE_BULK_STRING = ord(b"$")
 
 
-class Shard:
+class DB:
     def __init__(self):
         self.expirations: dict[bytes, Any] = collections.defaultdict(
             lambda: float("inf")
@@ -40,29 +38,7 @@ class Shard:
         return self
 
 
-class DB:
-    def __init__(self):
-        self.num_shards = os.cpu_count() or 1
-        print(f"Using {self.num_shards} shards")
-        self.shards = [Shard() for _ in range(self.num_shards)]
-
-    def __contains__(self, key):
-        return key in self._db(key).data
-
-    def get(self, key, default=None):
-        return self._db(key).data.get(key, default)
-
-    def __setitem__(self, key, value):
-        self._db(key).data[key] = value
-
-    def _db(self, key: bytes):
-        return self.shards[zlib.crc32(key) % self.num_shards]
-
-
-if os.getenv("MULTI"):
-    data = DB()
-else:
-    data = Shard()
+data = DB()
 
 
 def find_closed(buf: bytes, cursor: int, next_char=TERMINATE) -> int:
@@ -105,9 +81,9 @@ class Reader:
                         cursor += string_length + 2  # plus term
                 self.cmds.append(cmds)
 
-    def gets(self) -> Union[bool, List[bytes]]:
+    def gets(self) -> Optional[List[bytes]]:
         if len(self.cmds) == 0:
-            return False
+            return None
         return self.cmds.popleft()
 
 
@@ -133,7 +109,7 @@ class Core:
         resp = []
         while True:
             req = self.parser.gets()
-            if req is False:
+            if not req:
                 break
             cmd = req[0].upper()
             # print(f"Handle comand {cmd}")
@@ -319,7 +295,7 @@ class Core:
         else:
             shard.expirations.pop(key, None)
 
-    def _evit_if_expired(self, shard: Shard, key: bytes):
+    def _evit_if_expired(self, shard: DB, key: bytes):
         if key in shard.expirations and shard.expirations[key] < time.monotonic():
             del shard.expirations[key]
             del shard.data[key]
