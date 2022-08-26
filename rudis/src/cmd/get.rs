@@ -4,7 +4,6 @@ use bytes::Bytes;
 use tracing::{debug, instrument};
 
 #[derive(Debug)]
-
 pub struct Get {
     key: String,
 }
@@ -34,17 +33,14 @@ impl Get {
     ///
     /// The response is written into `dst`. This is called by the server in otrder to execute a
     /// received command
-    #[instrument(skip(self, db, dst))]
-    pub(crate) async fn apply(self, db: &Db, dst: &mut Connection) -> crate::Result<()> {
+    #[instrument(skip(self, db))]
+    pub(crate) async fn apply(self, db: &Db) -> crate::Result<Frame> {
         let response = if let Some(value) = db.get(&self.key) {
             Frame::Bulk(value)
         } else {
             Frame::Null
         };
-
-        debug!(?response);
-        dst.write_frame(&response).await?;
-        Ok(())
+        Ok(response)
     }
 
     pub(crate) fn into_frame(self) -> Frame {

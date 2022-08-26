@@ -138,6 +138,8 @@ impl Handler {
                 }
             };
 
+            debug!("Process Frame {:?}", maybe_frame);
+
             let frame = match maybe_frame {
                 Some(frame) => frame,
                 None => return Ok(()),
@@ -145,6 +147,8 @@ impl Handler {
 
             let cmd = Command::from_frame(frame)?;
 
+
+            debug!("Got CMD {:?}", cmd);
             debug!(?cmd);
 
             cmd.apply(&self.db, &mut self.connection, &mut self.shutdown).await?;

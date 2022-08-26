@@ -1,6 +1,7 @@
 use crate::frame::{self, Frame};
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BytesMut, BufMut};
+use log::{debug};
 use std::io::{self, Cursor};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
@@ -31,20 +32,43 @@ impl Connection {
     /// in closed in a way that doesn't break a frame in half, it returns
     /// `None`. Other wise, an error is returned!
     pub async fn read_frame(&mut self) -> crate::Result<Option<Frame>> {
+        let mut frames = Vec::new();
+        let mut butes_left;
         loop {
-            // attempt to parse a frame from the buffered data. If enough data
-            // has been buffeded, the frame is returned
             if let Some(frame) = self.parse_frame()? {
-                return Ok(Some(frame));
+                debug!("Got Frame: {:?}", frame);
+                frames.push(frame);
+                continue;
             }
 
-            if 0 == self.stream.read_buf(&mut self.buffer).await? {
-                if self.buffer.is_empty() {
-                    return Ok(None);
-                }
-                return Err("connection reset by pear".into());
+            // fast path
+            if frames.len() > 0 && self.buffer.is_empty() {
+                debug!("Fast path to parse stream");
+                break;
             }
+
+            debug!("Poll for new data");
+            butes_left = self.stream.read_buf(&mut self.buffer).await?;
+            // attempt to parse a frame from the buffered data. If enough data
+            // has been buffeded, the frame is returned
+            // no more data to read
+            debug!("Read {}, Buf Size {}, got buf `{:?}`", butes_left, self.buffer.len(),String::from_utf8_lossy(&self.buffer.to_vec()));
+
+            if butes_left == 0 && self.buffer.is_empty() {
+                debug!("No things left. Close Reading");
+                if frames.len() == 0 {
+                    return Err("closed".into());
+                }
+                break
+            }
+
         }
+
+        debug!("Got Num Frames {}", frames.len());
+        if frames.len() == 1 {
+            return Ok(Some(frames.remove(0)));
+        }
+        return Ok(Some(Frame::Pipe(frames)));
     }
 
     /// tries to parse a frame from the buffer. If the buffer contains enough
@@ -82,58 +106,21 @@ impl Connection {
     }
 
     pub async fn write_frame(&mut self, frame: &Frame) -> io::Result<()> {
-        match frame {
-            Frame::Array(val) => {
-                // array type
-                self.stream.write_u8(b'*').await?;
-                // size of array
-                self.write_decimal(val.len() as u64).await?;
-
-                // Iterate and encode each entry in the array
-                for entry in &**val {
-                    self.write_value(entry).await?;
-                }
-            },
-            _ => self.write_value(frame).await?,
-
-        }
-        // Ensure the encoded frame is written to the socket. The calls above
-        // are to the buffered stream and writes. Calling `flush` writes the remaining content of
-        // the buffer to the scoket
+        self.stream.write_all(&self.to_buf(frame)).await?;
         self.stream.flush().await
     }
 
-    /// Write a frame literal to the stream
-    async fn write_value(&mut self, frame: &Frame) -> io::Result<()> {
+    fn to_buf(&self,frame: &Frame) -> bytes::Bytes {
         match frame {
-            Frame::Simple(val) => {
-                self.stream.write_u8(b'+').await?;
-                self.stream.write_all(val.as_bytes()).await?;
-                self.stream.write_all(b"\r\n").await?;
+            Frame::Pipe(val) => {
+                let bfs = val.iter().map(_frame_to_buf).fold(bytes::BytesMut::new(), |mut acc, xd | {
+                    acc.extend(xd);
+                    acc
+                });
+                return bfs.freeze();
             }
-            Frame::Error(val) => {
-                self.stream.write_u8(b'-').await?;
-                self.stream.write_all(val.as_bytes()).await?;
-                self.stream.write_all(b"\r\n").await?;
-            }
-            Frame::Integer(val) => {
-                self.stream.write_u8(b':').await?;
-                self.write_decimal(*val).await?;
-            }
-            Frame::Null => {
-                self.stream.write_all(b"$-1\r\n").await?;
-            }
-            Frame::Bulk(val) => {
-                let len = val.len();
-                self.stream.write_u8(b'$').await?;
-                self.write_decimal(len as u64).await?;
-                self.stream.write_all(val).await?;
-                self.stream.write_all(b"\r\n").await?;
-            }
-            Frame::Array(_val) => unreachable!(),
+            _ => _frame_to_buf(frame).freeze(),
         }
-
-        Ok(())
     }
 
     async fn write_decimal(&mut self, val: u64) -> io::Result<()> {
@@ -141,12 +128,63 @@ impl Connection {
 
         // convert the vlaue into a string
         let mut buf = [0u8, 20];
-        let mut buf = Cursor::new(&mut buf[..]);
-        write!(&mut buf, "{}", val)?;
+        let mut buf = Cursor::new(&mut buf[..]); write!(&mut buf, "{}", val)?;
 
         let pos = buf.position() as usize;
         self.stream.write_all(&buf.get_ref()[..pos]).await?;
         self.stream.write_all(b"\r\n").await?;
         Ok(())
     }
+}
+
+fn _dec_to_buf(val: u64) -> io::Result<Vec<u8>> {
+    use std::io::Write;
+
+    let mut buf = [0u8, 20];
+    let mut buf = Cursor::new(&mut buf[..]);
+    write!(&mut buf, "{}", val)?;
+    let pos = buf.position() as usize;
+    let resp = &buf.get_ref()[..pos];
+    Ok(resp.into())
+}
+
+fn _frame_to_buf(frame: &Frame) -> bytes::BytesMut {
+    let mut buf  = bytes::BytesMut::new();
+    match frame {
+        Frame::Simple(val) => {
+            buf.put_u8(b'+');
+            buf.put(val.as_bytes());
+        }
+        Frame::Error(val) => {
+            buf.put_u8(b'-');
+            buf.put(val.as_bytes());
+        }
+        Frame::Integer(val) => {
+            buf.put_u8(b':');
+            buf.put_u64(*val);
+        }
+        Frame::Null => {
+            buf.put(&b"$-1"[..]);
+        }
+        Frame::Bulk(val) => {
+            let len = val.len();
+            buf.put_u8(b'$');
+            buf.extend(&_dec_to_buf(len as u64).unwrap());
+            buf.put(&b"\r\n"[..]);
+            buf.extend(val);
+        }
+        Frame::Array(val) => {
+            // array type
+            buf.put_u8(b'*');
+            // size of array
+            buf.extend(&_dec_to_buf(val.len() as u64).unwrap());
+            // Iterate and encode each entry in the array
+            for entry in &**val {
+                buf.extend(_frame_to_buf(entry));
+            }
+        },
+        Frame::Pipe(_val) => unreachable!(),
+    }
+    buf.put(&b"\r\n"[..]);
+    buf
 }

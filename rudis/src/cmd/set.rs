@@ -65,13 +65,11 @@ impl Set {
     }
 
 
-    pub(crate) async fn apply(self, db: &Db, dst: &mut Connection) -> crate::Result<()> {
+    pub(crate) async fn apply(self, db: &Db) -> crate::Result<Frame> {
         db.set(self.key, self.value, self.expire);
 
         let response = Frame::Simple("OK".to_string());
-        debug!(?response);
-        dst.write_frame(&response).await?;
-        Ok(())
+        Ok(response)
     }
 
     pub(crate) fn into_frame(self) -> Frame {

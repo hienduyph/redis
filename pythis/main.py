@@ -10,7 +10,7 @@ from typing import Any, List, Optional
 import time
 
 
-PORT = 6380
+PORT = 6379
 HOST = "127.0.0.1"
 
 TERMINATE = b"\r\n"

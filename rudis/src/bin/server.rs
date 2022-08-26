@@ -4,7 +4,7 @@ use structopt::StructOpt;
 use tokio::net::TcpListener;
 use tokio::signal;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 pub async fn main() -> rudis::Result<()> {
     tracing_subscriber::fmt::try_init()?;
     let cli = Cli::from_args();

@@ -43,9 +43,9 @@ impl Parse {
             Frame::Simple(s) => Ok(s),
             Frame::Bulk(data) => str::from_utf8(&data[..])
                 .map(|s| s.to_string())
-                .map_err(|_| "protocol error; iunvalid string".into()),
+                .map_err(|_| "protocol error; invalid string".into()),
             frame => Err(format!(
-                "protocol errpr; expected simple frame or bulk, got {:?}",
+                "protocol error; expected simple frame or bulk, got {:?}",
                 frame
             )
             .into()),
