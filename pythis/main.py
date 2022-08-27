@@ -92,6 +92,7 @@ class Core:
         self.parser = Reader()
         self.commands = {
             b"COMMAND": self.com_command,
+            b"CONFIG": self.com_config,
             b"GET": self.com_get,
             b"SET": self.com_set,
             b"PING": self.com_ping,
@@ -101,10 +102,14 @@ class Core:
             b"LRANGE": self.com_lrange,
             b"LPOP": self.com_lpop,
             b"RPOP": self.com_rpop,
-            b"CONFIG": self.com_config,
             b"HSET": self.com_hset,
             b"HGET": self.com_hget,
             b"HGETALL": self.com_hgetall,
+            b"SADD": self.com_sadd,
+            b"SPOP": self.com_spop,
+            b"SMEMBERS": self.com_smembers,
+            b"MSET": self.com_mset,
+            b"MGET": self.com_mget,
         }
 
     def process(self, buf: bytes) -> list[bytes]:
@@ -284,6 +289,9 @@ class Core:
     def com_hset(self, key: bytes, *args: bytes):
         shard = data._db(key)
         d = shard.get(key, collections.defaultdict())
+        if not d and not isinstance(d, dict):
+            return b"-WRONGTYPE invalid type"
+
         for i in range(0, len(args), 2):
             k, v = args[i], args[i + 1]
             d[k] = v
@@ -291,7 +299,10 @@ class Core:
         return b"+%d\r\n" % (len(args) / 2)
 
     def com_hget(self, key: bytes, field: bytes):
-        d = data._db(key).get(key, collections.defaultdict())
+        d = self._get(key, collections.defaultdict())
+        if not d or isinstance(d, collections.defaultdict):
+            return b"-WRONGTYPE must type dict, got %s" % type(d)
+
         if v := d.get(field, None):
             return b"$%d\r\n%s\r\n" % (len(v), v)
         return b"*0\r\n"
@@ -302,9 +313,67 @@ class Core:
                 b"$%d\r\n%s\r\n$%d\r\n%s\r\n" % (len(k), k, len(v), v)
                 for k, v in d.items()
             ]
-            prefix = b"*%d\r\n" % len(ar*2)
+            prefix = b"*%d\r\n" % len(ar * 2)
             return prefix + b"".join(ar)
         return b"*0\r\n"
+
+    def com_sadd(self, key: bytes, *members: bytes):
+        s = self._get(key, set())
+        if not isinstance(s, set):
+            return b"-WRONGTYPE run op on wrong type"
+
+        add = 0
+        for m in members:
+            if m not in s:
+                add += 1
+                s.add(m)
+
+        self._set(key, s)
+        return b"+%d\r\n" % add
+
+    def com_spop(self, key: bytes, *args: bytes):
+        s = self._get(key, set())
+        if not isinstance(s, set):
+            return b"-WRONGTYPE wrong type set"
+
+        # fast path
+        if len(s) == 0:
+            return b"*0\r\n"
+
+        num = 1
+        if len(args) == 1:
+            num = int(args[0])
+        items = []
+        for _ in range(num):
+            item = s.pop()
+            items.append(b"$%d\r\n%s\r\n" % (len(item), item))
+        prefix = b"*%d\r\n" % (len(items))
+        self._set(key, s)
+        return prefix + b"".join(items)
+
+    def com_smembers(self, key: bytes):
+        s = self._get(key, set())
+        if not isinstance(s, set):
+            return b"-WRONGTYPE of op"
+
+        items = [b"$%d\r\n%s\r\n" % (len(item), item) for item in s]
+        prefix = b"*%d\r\n" % len(items)
+        return prefix + b"".join(items)
+
+    def com_mset(self, *pairs: bytes):
+        for i in range(0, len(pairs), 2):
+            k, v = pairs[i], pairs[i+1]
+            self._set(k, v)
+        return b"+OK\r\n"
+
+    def com_mget(self, *keys: bytes):
+        items = (self._get(key, None) for key in keys)
+        items = [
+            b"$%d\r\n%s\r\n" % (len(item), item) if item is not None else b"$-1\r\n"
+            for item in items
+        ]
+        prefix = b"*%d\r\n" % len(items)
+        return prefix + b"".join(items)
 
     def _get(self, key, default=None):
         shard = data._db(key)
