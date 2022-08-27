@@ -102,6 +102,9 @@ class Core:
             b"LPOP": self.com_lpop,
             b"RPOP": self.com_rpop,
             b"CONFIG": self.com_config,
+            b"HSET": self.com_hset,
+            b"HGET": self.com_hget,
+            b"HGETALL": self.com_hgetall,
         }
 
     def process(self, buf: bytes) -> list[bytes]:
@@ -277,6 +280,31 @@ class Core:
         self._set(key, deque)
         size = b"*%d\r\n" % len(items)
         return size + b"".join(items)
+
+    def com_hset(self, key: bytes, *args: bytes):
+        shard = data._db(key)
+        d = shard.get(key, collections.defaultdict())
+        for i in range(0, len(args), 2):
+            k, v = args[i], args[i + 1]
+            d[k] = v
+        shard[key] = d
+        return b"+%d\r\n" % (len(args) / 2)
+
+    def com_hget(self, key: bytes, field: bytes):
+        d = data._db(key).get(key, collections.defaultdict())
+        if v := d.get(field, None):
+            return b"$%d\r\n%s\r\n" % (len(v), v)
+        return b"*0\r\n"
+
+    def com_hgetall(self, key: bytes):
+        if d := data._db(key).get(key, collections.defaultdict()):
+            ar = [
+                b"$%d\r\n%s\r\n$%d\r\n%s\r\n" % (len(k), k, len(v), v)
+                for k, v in d.items()
+            ]
+            prefix = b"*%d\r\n" % len(ar*2)
+            return prefix + b"".join(ar)
+        return b"*0\r\n"
 
     def _get(self, key, default=None):
         shard = data._db(key)

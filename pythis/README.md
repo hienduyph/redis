@@ -3,11 +3,12 @@
 Just for fun and learn how redis works
 
 ```bash
-pip install -r ./requirements.txt
+# if you want to use uvloop as default EventLoopPolicy
+# pip install uvloop
+
 ./main.py
 ```
 
 ```bash
-redis-cli -p 6380
+redis-cli
 ```
-
