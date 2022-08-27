@@ -16,20 +16,21 @@ GET: 513083.62 requests per second, p50=0.255 msec
 
 ```bash
 ./main.py --handle protocol
-SET: 164826.11 requests per second, p50=1.535 msec
-GET: 191864.94 requests per second, p50=1.303 msec
+SET: 168548.80 requests per second, p50=1.463 msec
+GET: 190294.95 requests per second, p50=1.263 msec
 ```
 
 
 ```bash
 ./main.py --handle server
-SET: 145264.39 requests per second, p50=1.791 msec
-GET: 161864.69 requests per second, p50=1.583 msec
+SET: 151998.78 requests per second, p50=1.639 msec
+GET: 167140.23 requests per second, p50=1.487 msec
 ```
 
 ```bash
 ./main.py --handle plain_socket
-# too slow
+SET: 117247.04 requests per second, p50=2.111 msec
+GET: 125691.30 requests per second, p50=1.967 msec
 ```
 
 ### Rust
